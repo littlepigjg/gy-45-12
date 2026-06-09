@@ -1,10 +1,26 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
-import { Upload, Download, Scissors, ScanEye, RotateCcw, Check, FolderPlus, Trash2, Package } from 'lucide-react';
+import {
+  Upload, Scissors, ScanEye, RotateCcw, Check, FolderPlus,
+  Trash2, Package, Grid3x3, Sparkles, AlertTriangle, Layers, Eye, Plus,
+} from 'lucide-react';
 import JSZip from 'jszip';
-import { fileToDataUrl, createIconItemsFromFiles, cn } from '@/utils';
+import { fileToDataUrl, createIconItemsFromFiles, cn, generateId } from '@/utils';
 import { splitSprite, autoDetectGrid } from '@/services/spriteSplitter';
+import { smartDetect, cropBoxesToIcons } from '@/services/smartDetector';
 import { useAppStore } from '@/store/useAppStore';
-import type { SplitConfig, SplitIcon } from '@/types';
+import type { SplitConfig, SplitIcon, DetectionMode, DetectionBox, SmartDetectionResult } from '@/types';
+import BoxEditor from '@/components/splitter/BoxEditor';
+
+const GROUP_COLORS = [
+  '#22d3ee',
+  '#f59e0b',
+  '#f43f5e',
+  '#a78bfa',
+  '#34d399',
+  '#fb7185',
+  '#60a5fa',
+  '#fbbf24',
+];
 
 export default function Splitter() {
   const inputRef = useRef<HTMLInputElement>(null);
@@ -12,6 +28,8 @@ export default function Splitter() {
   const [spriteSize, setSpriteSize] = useState({ width: 0, height: 0 });
   const [isDragging, setIsDragging] = useState(false);
   const [splitIcons, setSplitIcons] = useState<SplitIcon[]>([]);
+
+  const [detectionMode, setDetectionMode] = useState<DetectionMode>('grid');
   const [config, setConfig] = useState<SplitConfig>({
     rows: 4,
     columns: 4,
@@ -21,6 +39,14 @@ export default function Splitter() {
     padding: 0,
   });
   const [autoDetecting, setAutoDetecting] = useState(false);
+  const [autoTrim, setAutoTrim] = useState(true);
+
+  const [detectionBoxes, setDetectionBoxes] = useState<DetectionBox[]>([]);
+  const [selectedBoxId, setSelectedBoxId] = useState<string | null>(null);
+  const [smartResult, setSmartResult] = useState<SmartDetectionResult | null>(null);
+  const [showGroups, setShowGroups] = useState(true);
+  const [hideUncertain, setHideUncertain] = useState(false);
+
   const [showProjectModal, setShowProjectModal] = useState(false);
   const [selectedProjectId, setSelectedProjectId] = useState('');
   const [saved, setSaved] = useState(false);
@@ -32,6 +58,9 @@ export default function Splitter() {
     const dataUrl = await fileToDataUrl(file);
     setSpriteDataUrl(dataUrl);
     setSplitIcons([]);
+    setDetectionBoxes([]);
+    setSmartResult(null);
+    setSelectedBoxId(null);
 
     const img = new Image();
     img.onload = () => {
@@ -44,15 +73,22 @@ export default function Splitter() {
     if (!spriteDataUrl) return;
     setAutoDetecting(true);
     try {
-      const detected = await autoDetectGrid(spriteDataUrl);
-      setConfig({
-        rows: detected.rows,
-        columns: detected.columns,
-        iconWidth: detected.iconWidth,
-        iconHeight: detected.iconHeight,
-        spacing: detected.spacing,
-        padding: 0,
-      });
+      if (detectionMode === 'grid') {
+        const detected = await autoDetectGrid(spriteDataUrl);
+        setConfig({
+          rows: detected.rows,
+          columns: detected.columns,
+          iconWidth: detected.iconWidth,
+          iconHeight: detected.iconHeight,
+          spacing: detected.spacing,
+          padding: 0,
+        });
+      } else {
+        const result = await smartDetect(spriteDataUrl);
+        setSmartResult(result);
+        setDetectionBoxes(result.boxes);
+        setSelectedBoxId(null);
+      }
     } finally {
       setAutoDetecting(false);
     }
@@ -65,14 +101,24 @@ export default function Splitter() {
       return;
     }
     const timer = setTimeout(async () => {
-      const icons = await splitSprite(spriteDataUrl, config, true);
+      let icons: SplitIcon[] = [];
+      if (detectionMode === 'grid') {
+        icons = await splitSprite(spriteDataUrl, config, autoTrim);
+      } else {
+        const boxes = hideUncertain
+          ? detectionBoxes.filter((b) => !b.uncertain)
+          : detectionBoxes;
+        if (boxes.length > 0) {
+          icons = await cropBoxesToIcons(spriteDataUrl, boxes, autoTrim);
+        }
+      }
       if (!cancelled) setSplitIcons(icons);
-    }, 100);
+    }, 150);
     return () => {
       cancelled = true;
       clearTimeout(timer);
     };
-  }, [spriteDataUrl, config]);
+  }, [spriteDataUrl, config, detectionMode, detectionBoxes, autoTrim, hideUncertain]);
 
   const onDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -140,6 +186,49 @@ export default function Splitter() {
     setConfig((c) => ({ ...c, [key]: Math.max(0, value) }));
   };
 
+  const switchDetectionMode = (mode: DetectionMode) => {
+    setDetectionMode(mode);
+    setSplitIcons([]);
+    if (mode === 'grid') {
+      setDetectionBoxes([]);
+      setSmartResult(null);
+      setSelectedBoxId(null);
+    } else {
+      setSelectedBoxId(null);
+    }
+  };
+
+  const addBoxAtCenter = () => {
+    if (!spriteDataUrl) return;
+    const cx = spriteSize.width / 2 - 24;
+    const cy = spriteSize.height / 2 - 24;
+    const newBox: DetectionBox = {
+      id: generateId(),
+      x: Math.max(0, cx),
+      y: Math.max(0, cy),
+      width: 48,
+      height: 48,
+      confidence: 0.6,
+      uncertain: false,
+    };
+    setDetectionBoxes((prev) => [...prev, newBox]);
+    setSelectedBoxId(newBox.id);
+  };
+
+  const clearUncertain = () => {
+    setDetectionBoxes((prev) => prev.filter((b) => !b.uncertain));
+  };
+
+  const groupColors = smartResult
+    ? smartResult.groups.map((g, i) => ({ id: g.id, color: GROUP_COLORS[i % GROUP_COLORS.length] }))
+    : [];
+
+  const displayBoxes = hideUncertain
+    ? detectionBoxes.filter((b) => !b.uncertain)
+    : detectionBoxes;
+
+  const uncertainCount = detectionBoxes.filter((b) => b.uncertain).length;
+
   return (
     <div className="h-full flex flex-col">
       <header className="shrink-0 px-6 py-4 border-b border-ink-700/50 flex items-center justify-between">
@@ -163,7 +252,7 @@ export default function Splitter() {
         </div>
       </header>
 
-      <div className="flex-1 min-h-0 grid grid-cols-[320px_1fr] gap-0">
+      <div className="flex-1 min-h-0 grid grid-cols-[340px_1fr] gap-0">
         <div className="flex flex-col border-r border-ink-700/50 overflow-hidden">
           <div className="p-4 border-b border-ink-700/50">
             <div className="flex items-center justify-between mb-3">
@@ -177,6 +266,8 @@ export default function Splitter() {
                     setSpriteDataUrl('');
                     setSplitIcons([]);
                     setSpriteSize({ width: 0, height: 0 });
+                    setDetectionBoxes([]);
+                    setSmartResult(null);
                   }}
                   className="btn-ghost btn !px-2 !py-1 text-xs"
                 >
@@ -227,7 +318,42 @@ export default function Splitter() {
             <div className="flex items-center justify-between mb-3">
               <h3 className="font-semibold text-sm text-white flex items-center gap-2">
                 <Scissors className="w-4 h-4 text-neon-amber" />
-                拆分配置
+                检测模式
+              </h3>
+            </div>
+
+            <div className="grid grid-cols-2 gap-2 mb-4">
+              <button
+                onClick={() => switchDetectionMode('grid')}
+                className={cn(
+                  'p-3 rounded-lg border transition-all text-left',
+                  detectionMode === 'grid'
+                    ? 'border-neon-cyan/60 bg-neon-cyan/10'
+                    : 'border-ink-600 bg-ink-800 hover:border-ink-500'
+                )}
+              >
+                <Grid3x3 className={cn('w-5 h-5 mb-1', detectionMode === 'grid' ? 'text-neon-cyan' : 'text-slate-400')} />
+                <div className={cn('text-xs font-medium', detectionMode === 'grid' ? 'text-white' : 'text-slate-300')}>固定网格</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">规则排列图标</div>
+              </button>
+              <button
+                onClick={() => switchDetectionMode('smart')}
+                className={cn(
+                  'p-3 rounded-lg border transition-all text-left',
+                  detectionMode === 'smart'
+                    ? 'border-neon-cyan/60 bg-neon-cyan/10'
+                    : 'border-ink-600 bg-ink-800 hover:border-ink-500'
+                )}
+              >
+                <Sparkles className={cn('w-5 h-5 mb-1', detectionMode === 'smart' ? 'text-neon-cyan' : 'text-slate-400')} />
+                <div className={cn('text-xs font-medium', detectionMode === 'smart' ? 'text-white' : 'text-slate-300')}>智能检测</div>
+                <div className="text-[10px] text-slate-500 mt-0.5">不规则布局</div>
+              </button>
+            </div>
+
+            <div className="flex items-center justify-between mb-3">
+              <h3 className="font-semibold text-sm text-white">
+                {detectionMode === 'grid' ? '网格配置' : '智能配置'}
               </h3>
               <button
                 onClick={runAutoDetect}
@@ -239,50 +365,177 @@ export default function Splitter() {
               </button>
             </div>
 
-            <div className="space-y-3">
-              {[
-                { label: '行数', key: 'rows' as const, min: 1 },
-                { label: '列数', key: 'columns' as const, min: 1 },
-                { label: '图标宽度', key: 'iconWidth' as const, min: 1 },
-                { label: '图标高度', key: 'iconHeight' as const, min: 1 },
-                { label: '间距', key: 'spacing' as const, min: 0 },
-                { label: '内边距', key: 'padding' as const, min: 0 },
-              ].map(({ label, key, min }) => (
-                <div key={key} className="flex items-center justify-between gap-3">
-                  <label className="text-xs text-slate-400 shrink-0 w-20">{label} (px)</label>
-                  <div className="flex items-center gap-1">
-                    <button
-                      onClick={() => updateConfig(key, config[key] - 1)}
-                      disabled={config[key] <= min}
-                      className="w-6 h-7 rounded bg-ink-800 border border-ink-600 text-slate-400 hover:text-slate-200 hover:border-ink-500 disabled:opacity-30 text-sm"
-                    >
-                      −
-                    </button>
-                    <input
-                      type="number"
-                      min={min}
-                      value={config[key]}
-                      onChange={(e) => updateConfig(key, parseInt(e.target.value) || min)}
-                      className="w-16 h-7 bg-ink-800 border border-ink-600 rounded px-2 text-xs text-slate-200 text-center focus:outline-none focus:border-neon-cyan/60"
-                    />
-                    <button
-                      onClick={() => updateConfig(key, config[key] + 1)}
-                      className="w-6 h-7 rounded bg-ink-800 border border-ink-600 text-slate-400 hover:text-slate-200 hover:border-ink-500 text-sm"
-                    >
-                      +
-                    </button>
+            {detectionMode === 'grid' ? (
+              <div className="space-y-3">
+                {[
+                  { label: '行数', key: 'rows' as const, min: 1 },
+                  { label: '列数', key: 'columns' as const, min: 1 },
+                  { label: '图标宽度', key: 'iconWidth' as const, min: 1 },
+                  { label: '图标高度', key: 'iconHeight' as const, min: 1 },
+                  { label: '间距', key: 'spacing' as const, min: 0 },
+                  { label: '内边距', key: 'padding' as const, min: 0 },
+                ].map(({ label, key, min }) => (
+                  <div key={key} className="flex items-center justify-between gap-3">
+                    <label className="text-xs text-slate-400 shrink-0 w-20">{label} (px)</label>
+                    <div className="flex items-center gap-1">
+                      <button
+                        onClick={() => updateConfig(key, config[key] - 1)}
+                        disabled={config[key] <= min}
+                        className="w-6 h-7 rounded bg-ink-800 border border-ink-600 text-slate-400 hover:text-slate-200 hover:border-ink-500 disabled:opacity-30 text-sm"
+                      >
+                        −
+                      </button>
+                      <input
+                        type="number"
+                        min={min}
+                        value={config[key]}
+                        onChange={(e) => updateConfig(key, parseInt(e.target.value) || min)}
+                        className="w-16 h-7 bg-ink-800 border border-ink-600 rounded px-2 text-xs text-slate-200 text-center focus:outline-none focus:border-neon-cyan/60"
+                      />
+                      <button
+                        onClick={() => updateConfig(key, config[key] + 1)}
+                        className="w-6 h-7 rounded bg-ink-800 border border-ink-600 text-slate-400 hover:text-slate-200 hover:border-ink-500 text-sm"
+                      >
+                        +
+                      </button>
+                    </div>
                   </div>
-                </div>
-              ))}
+                ))}
 
-              <button
-                onClick={() => setConfig({ rows: 4, columns: 4, iconWidth: 32, iconHeight: 32, spacing: 0, padding: 0 })}
-                className="w-full btn-ghost btn text-xs mt-2"
-              >
-                <RotateCcw className="w-3.5 h-3.5" />
-                重置默认
-              </button>
-            </div>
+                <button
+                  onClick={() => setConfig({ rows: 4, columns: 4, iconWidth: 32, iconHeight: 32, spacing: 0, padding: 0 })}
+                  className="w-full btn-ghost btn text-xs mt-2"
+                >
+                  <RotateCcw className="w-3.5 h-3.5" />
+                  重置默认
+                </button>
+              </div>
+            ) : (
+              <div className="space-y-3">
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoTrim}
+                    onChange={(e) => setAutoTrim(e.target.checked)}
+                    className="rounded bg-ink-800 border-ink-600"
+                  />
+                  <span className="text-xs text-slate-300">自动裁剪透明边缘</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={hideUncertain}
+                    onChange={(e) => setHideUncertain(e.target.checked)}
+                    className="rounded bg-ink-800 border-ink-600"
+                  />
+                  <span className="text-xs text-slate-300">隐藏待确认区域</span>
+                </label>
+                <label className="flex items-center gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={showGroups}
+                    onChange={(e) => setShowGroups(e.target.checked)}
+                    className="rounded bg-ink-800 border-ink-600"
+                  />
+                  <span className="text-xs text-slate-300">显示尺寸分组颜色</span>
+                </label>
+
+                <div className="pt-2 border-t border-ink-700/50 space-y-2">
+                  <button
+                    onClick={addBoxAtCenter}
+                    disabled={!spriteDataUrl}
+                    className="w-full btn btn-secondary text-xs disabled:opacity-40"
+                  >
+                    <Plus className="w-3.5 h-3.5" />
+                    添加检测框
+                  </button>
+                  {uncertainCount > 0 && (
+                    <button
+                      onClick={clearUncertain}
+                      className="w-full btn-ghost btn text-xs text-amber-400 hover:text-amber-300"
+                    >
+                      <Trash2 className="w-3.5 h-3.5" />
+                      清除 {uncertainCount} 个待确认框
+                    </button>
+                  )}
+                </div>
+
+                {smartResult && (
+                  <div className="pt-2 border-t border-ink-700/50">
+                    <div className="flex items-center gap-1.5 mb-2">
+                      <Layers className="w-3.5 h-3.5 text-neon-cyan" />
+                      <span className="text-xs font-semibold text-white">检测结果</span>
+                    </div>
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-400">检测方式</span>
+                        <span className="text-slate-200 font-mono">
+                          {smartResult.method === 'grid' ? '规则网格' :
+                           smartResult.method === 'edge' ? '边缘检测' : '混合模式'}
+                        </span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-400">检测到图标</span>
+                        <span className="text-neon-cyan font-mono">{smartResult.boxes.length}</span>
+                      </div>
+                      <div className="flex items-center justify-between text-xs">
+                        <span className="text-slate-400">尺寸分组</span>
+                        <span className="text-neon-amber font-mono">{smartResult.groups.length}</span>
+                      </div>
+                      {uncertainCount > 0 && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-400 flex items-center gap-1">
+                            <AlertTriangle className="w-3 h-3 text-amber-400" />
+                            待确认
+                          </span>
+                          <span className="text-amber-400 font-mono">{uncertainCount}</span>
+                        </div>
+                      )}
+                      {smartResult.backgroundDetected && smartResult.backgroundColor && (
+                        <div className="flex items-center justify-between text-xs">
+                          <span className="text-slate-400">背景色</span>
+                          <span className="flex items-center gap-1.5">
+                            <span
+                              className="w-3 h-3 rounded border border-ink-600"
+                              style={{
+                                backgroundColor: `rgb(${smartResult.backgroundColor.r},${smartResult.backgroundColor.g},${smartResult.backgroundColor.b})`,
+                              }}
+                            />
+                            <span className="text-slate-300 font-mono">
+                              #{smartResult.backgroundColor.r.toString(16).padStart(2, '0')}
+                              {smartResult.backgroundColor.g.toString(16).padStart(2, '0')}
+                              {smartResult.backgroundColor.b.toString(16).padStart(2, '0')}
+                            </span>
+                          </span>
+                        </div>
+                      )}
+                    </div>
+
+                    {smartResult.groups.length > 1 && showGroups && (
+                      <div className="mt-3 pt-2 border-t border-ink-700/50">
+                        <div className="text-[10px] text-slate-500 mb-1.5 uppercase tracking-wider">尺寸分组</div>
+                        <div className="space-y-1">
+                          {smartResult.groups.map((g, i) => (
+                            <div key={g.id} className="flex items-center gap-2">
+                              <span
+                                className="w-2.5 h-2.5 rounded-sm"
+                                style={{ backgroundColor: GROUP_COLORS[i % GROUP_COLORS.length] }}
+                              />
+                              <span className="text-xs text-slate-300 font-mono">
+                                {g.avgWidth}×{g.avgHeight}
+                              </span>
+                              <span className="text-[10px] text-slate-500 ml-auto">
+                                {g.boxIds.length} 个
+                              </span>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+              </div>
+            )}
           </div>
 
           {splitIcons.length > 0 && (
@@ -310,6 +563,9 @@ export default function Splitter() {
                       <div className="text-[10px] text-slate-400 truncate font-mono group-hover:text-neon-cyan">
                         {icon.name}
                       </div>
+                      <div className="text-[9px] text-slate-600 font-mono">
+                        {icon.width}×{icon.height}
+                      </div>
                     </button>
                   ))}
                 </div>
@@ -319,50 +575,87 @@ export default function Splitter() {
         </div>
 
         <div className="flex flex-col overflow-hidden">
-          <div className="px-4 py-3 border-b border-ink-700/50">
-            <h3 className="font-semibold text-sm text-white flex items-center gap-2">
-              <ScanEye className="w-4 h-4 text-neon-cyan" />
-              预览网格
-            </h3>
-          </div>
-          <div className="flex-1 overflow-auto scrollbar-thin bg-ink-950/50 p-8 flex items-start justify-center">
-            {!spriteDataUrl ? (
-              <div className="h-full flex flex-col items-center justify-center text-slate-600">
-                <Scissors className="w-16 h-16 mb-4 opacity-30" />
-                <div className="text-sm">上传精灵图开始拆分</div>
+          {detectionMode === 'grid' ? (
+            <>
+              <div className="px-4 py-3 border-b border-ink-700/50">
+                <h3 className="font-semibold text-sm text-white flex items-center gap-2">
+                  <ScanEye className="w-4 h-4 text-neon-cyan" />
+                  预览网格
+                </h3>
               </div>
-            ) : (
-              <div className="relative checkerboard rounded-lg p-4 inline-block">
-                <img src={spriteDataUrl} alt="sprite" className="block max-w-none" style={{ imageRendering: 'pixelated' }} />
-                <svg
-                  className="absolute top-4 left-4 pointer-events-none"
-                  width={spriteSize.width}
-                  height={spriteSize.height}
-                >
-                  {Array.from({ length: config.rows }).map((_, r) =>
-                    Array.from({ length: config.columns }).map((_, c) => {
-                      const x = config.padding + c * (config.iconWidth + config.spacing);
-                      const y = config.padding + r * (config.iconHeight + config.spacing);
-                      return (
-                        <rect
-                          key={`${r}-${c}`}
-                          x={x}
-                          y={y}
-                          width={config.iconWidth}
-                          height={config.iconHeight}
-                          fill="none"
-                          stroke="#22d3ee"
-                          strokeWidth={1}
-                          strokeDasharray="4,2"
-                          opacity={0.6}
-                        />
-                      );
-                    })
+              <div className="flex-1 overflow-auto scrollbar-thin bg-ink-950/50 p-8 flex items-start justify-center">
+                {!spriteDataUrl ? (
+                  <div className="h-full flex flex-col items-center justify-center text-slate-600">
+                    <Scissors className="w-16 h-16 mb-4 opacity-30" />
+                    <div className="text-sm">上传精灵图开始拆分</div>
+                  </div>
+                ) : (
+                  <div className="relative checkerboard rounded-lg p-4 inline-block">
+                    <img src={spriteDataUrl} alt="sprite" className="block max-w-none" style={{ imageRendering: 'pixelated' }} />
+                    <svg
+                      className="absolute top-4 left-4 pointer-events-none"
+                      width={spriteSize.width}
+                      height={spriteSize.height}
+                    >
+                      {Array.from({ length: config.rows }).map((_, r) =>
+                        Array.from({ length: config.columns }).map((_, c) => {
+                          const x = config.padding + c * (config.iconWidth + config.spacing);
+                          const y = config.padding + r * (config.iconHeight + config.spacing);
+                          return (
+                            <rect
+                              key={`${r}-${c}`}
+                              x={x}
+                              y={y}
+                              width={config.iconWidth}
+                              height={config.iconHeight}
+                              fill="none"
+                              stroke="#22d3ee"
+                              strokeWidth={1}
+                              strokeDasharray="4,2"
+                              opacity={0.6}
+                            />
+                          );
+                        })
+                      )}
+                    </svg>
+                  </div>
+                )}
+              </div>
+            </>
+          ) : (
+            <>
+              <div className="px-4 py-3 border-b border-ink-700/50 flex items-center justify-between">
+                <h3 className="font-semibold text-sm text-white flex items-center gap-2">
+                  <Eye className="w-4 h-4 text-neon-cyan" />
+                  智能检测预览
+                  {detectionBoxes.length > 0 && (
+                    <span className="text-xs font-normal text-slate-500 ml-2">
+                      拖拽移动框，拖动角落调整大小
+                    </span>
                   )}
-                </svg>
+                </h3>
               </div>
-            )}
-          </div>
+              {!spriteDataUrl ? (
+                <div className="flex-1 overflow-auto scrollbar-thin bg-ink-950/50 p-8 flex items-start justify-center">
+                  <div className="h-full flex flex-col items-center justify-center text-slate-600">
+                    <Sparkles className="w-16 h-16 mb-4 opacity-30" />
+                    <div className="text-sm">上传精灵图开始智能检测</div>
+                  </div>
+                </div>
+              ) : (
+                <BoxEditor
+                  imageSrc={spriteDataUrl}
+                  imageWidth={spriteSize.width}
+                  imageHeight={spriteSize.height}
+                  boxes={displayBoxes}
+                  onChange={setDetectionBoxes}
+                  selectedBoxId={selectedBoxId}
+                  onSelectBox={setSelectedBoxId}
+                  groups={showGroups ? groupColors : []}
+                />
+              )}
+            </>
+          )}
         </div>
       </div>
 

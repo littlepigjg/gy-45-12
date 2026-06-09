@@ -64,3 +64,31 @@ export interface SplitIcon {
   height: number;
   name: string;
 }
+
+export interface DetectionBox {
+  id: string;
+  x: number;
+  y: number;
+  width: number;
+  height: number;
+  confidence: number;
+  uncertain?: boolean;
+  groupId?: string;
+}
+
+export interface DetectionGroup {
+  id: string;
+  avgWidth: number;
+  avgHeight: number;
+  boxIds: string[];
+}
+
+export interface SmartDetectionResult {
+  boxes: DetectionBox[];
+  groups: DetectionGroup[];
+  method: 'edge' | 'grid' | 'hybrid';
+  backgroundDetected: boolean;
+  backgroundColor: { r: number; g: number; b: number } | null;
+}
+
+export type DetectionMode = 'grid' | 'smart';
